@@ -135,7 +135,7 @@ subnet_route_table_association = azure_classic.network.SubnetRouteTableAssociati
     route_table_id=VnetToFw_route_table.id)
 
 # Create VNET-to-HUB Peering
-vnet_virtual_network_peering = azure_native.network.VirtualNetworkPeering("DEV-EIP-WEST1-to-HUB",
+vnet_virtual_network_peering = azure_native.network.VirtualNetworkPeering("DEV-WEST1-to-HUB",
     allow_forwarded_traffic=True,
     allow_gateway_transit=False,
     allow_virtual_network_access=True,
@@ -220,4 +220,4 @@ pulumi.export("VM 1 Hostname", vm1_vm_name)
 pulumi.export(str(vm1_vm_name) + " Private IP", VM1_network_interface.private_ip_address)
 pulumi.export(str(vm1_vm_name) + "-Public-IP FQDN", VM1_public_ip.fqdn)
 pulumi.export(str(vm1_vm_name) + "-Public-IP", VM1_public_ip.ip_address.apply(lambda v: v or "pending…"))
-pulumi.export("DEV-EIP-WEST1-to-HUB Peering CIDR", hub_cidr)
+pulumi.export("DEV-WEST1-to-HUB Peering CIDR", hub_cidr)

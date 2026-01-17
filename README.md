@@ -1,4 +1,4 @@
-# Azure Spoke Network with Pulumi & Docker
+# azure-spoke-network
 
 This repository contains a Pulumi-based Python project that provisions Azure spoke network infrastructure. It uses Pulumi, Azure SDKs, and supporting scripts to build:
 
@@ -81,10 +81,10 @@ python set_default_vars.py
 pulumi config set --path azure:subscriptionId xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 
 pulumi config set --path azure:tenantId xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 pulumi config set --path azure-native:location WestUS
-pulumi config set rg_prefix DEV-EIP
+pulumi config set rg_prefix DEV
 pulumi config set --path vnet1.cidr xx.xx.xx.xx/24
 pulumi config set --path vnet1.prefix WEST-1
-pulumi config set --path vm1.name eipaztest1
+pulumi config set --path vm1.name aztest1
 pulumi config set --path vm1.admin_pw '<insert keeper pw: https://keepersecurity.com/vault/#detail/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx>' --secret
 pulumi config set trust_network_interface xx.xx.xx.xx
 pulumi config set cloud_network_env azure-test
