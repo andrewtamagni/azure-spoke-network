@@ -1,0 +1,24 @@
+config:
+  azure-native:location: WestUS
+  azure-spoke-network:cloud_network_spaces:
+    azure_prod:
+      vnet_cidr: xx.xx.xx.xx/20
+    azure_test:
+      vnet_cidr: xx.xx.xx.xx/20
+  azure-spoke-network:on_prem_source_ip_range: xx.xx.xx.xx/16
+  azure-spoke-network:rg_prefix: DEV-EIP
+  azure-spoke-network:trust_network_interface: xx.xx.xx.xx
+  azure-spoke-network:vm1:
+    admin_pw:
+      secure: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    admin_username: azadmin
+    name: eipaztest1
+  azure-spoke-network:vnet1:
+    cidr: xx.xx.xx.xx/24
+    prefix: WEST-1
+  azure:subscriptionId: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  azure:tenantId: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  azure-spoke-network:peerings:
+    hub_vnet_id: /subscriptions/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/resourceGroups/DEV-Networking/providers/Microsoft.Network/virtualNetworks/DEV-HUB
+    hub_cidr: xx.xx.xx.xx/22
+  azure-spoke-network:cloud_network_env: azure-test

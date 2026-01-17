@@ -1,0 +1,23 @@
+azure:subscriptionId: __REQUIRED__
+azure:tenantId: __REQUIRED__
+azure-native:location: __REQUIRED__
+rg_prefix: __REQUIRED__
+vnet1: 
+  cidr: __REQUIRED__
+  prefix: __REQUIRED__
+on_prem_source_ip_range: xx.xx.xx.xx/16
+vm1:
+  name: __REQUIRED__
+  admin_username: azadmin
+  admin_pw: __SECRET__
+trust_network_interface: __REQUIRED__
+cloud_network_env: __REQUIRED__
+cloud_network_spaces:
+  azure_prod:
+    vnet_cidr: xx.xx.xx.xx/20
+  azure_test:
+    vnet_cidr: xx.xx.xx.xx/20
+  #aws_prod:
+  #aws_test:
+  #gcp_prod:
+  #gcp_test:
