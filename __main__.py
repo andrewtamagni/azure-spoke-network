@@ -1,223 +1,203 @@
 """An Azure RM Python Pulumi program"""
-# Developed on 12/2021 by Andrew Tamagni - STO
-# Updated 10/22/2025 by Andrew Tamagni - STO: Converted Windows VM to Ubuntu VM.  Added Peering to Hub VNET.
+# Developed on 12/2021 by Andrew Tamagni
+# Updated 10/22/2025 by Andrew Tamagni - Converted Windows VM to Ubuntu VM.  Added Peering to Hub VNET.
+# Updated: Route tables, NSG rules, peerings from Pulumi.<stack>.yaml (config-driven, like azure-core-infrastructure).
 
 import pulumi
+from pulumi import StackReference
 from pulumi_azure_native import storage
 from pulumi_azure_native import resources
 import pulumi_azure_native as azure_native
 import pulumi_azure_native.network as azure_native_networking
 import pulumi_azure as azure_classic
+from azure.identity import AzureCliCredential
+from azure.keyvault.secrets import SecretClient
 from pulumi_azure_native.network import network_security_group
 from pulumi_azure_native.network.network_security_group import NetworkSecurityGroup
 
 pulumi.log.info("Deploying Resources")
 
-cfg = pulumi.Config()
-cfg_az = pulumi.Config("azure-native")
-rg_prefix = cfg.require("rg_prefix")
-vnet1 = cfg.require_object("vnet1")
-vnet1_cidr = vnet1["cidr"]
-vnet1_prefix = vnet1["prefix"]
-vm1 = cfg.require_object("vm1")
-vm1_vm_name = vm1["name"]
-vm1_admin_username = vm1["admin_username"]
-vm1_admin_password = vm1["admin_pw"]
-on_prem_source_ip_range = cfg.require("on_prem_source_ip_range")
-trust_network_interface = cfg.require("trust_network_interface")
+def build_hub_nsg_rules(rules_list: list, cfg) -> list:
+    """Convert `hub_nsg_rules` config entries into NSG security rule arguments.
+    Keeps NSG rule definitions declarative in `Pulumi.<stack>.yaml`.
+    """
+    out = []
+    for rule in rules_list:
+        source = resolve_nsg_address(rule, "source_address_prefix", cfg)
+        dest = resolve_nsg_address(rule, "destination_address_prefix", cfg)
+        out.append(azure_classic.network.NetworkSecurityGroupSecurityRuleArgs(
+            name=rule["name"],
+            description=rule.get("description", "Rule"),
+            protocol=rule.get("protocol", "*"),
+            source_port_range=rule.get("source_port_range", "*"),
+            destination_port_range=rule.get("destination_port_range", "*"),
+            source_address_prefix=source,
+            destination_address_prefix=dest,
+            access=rule["access"],
+            priority=rule["priority"],
+            direction=rule["direction"],
+        ))
+    return out
 
-# Peerings
-config_peerings = cfg.require_object('peerings')
-hub_vnet_id = config_peerings['hub_vnet_id']
-hub_cidr = config_peerings['hub_cidr']
+def build_routes(route_list, network_resource_prefix, address_refs, trust_nic_ip, untrust_nic_ip, cfg):
+    """Build `RouteArgs` objects from stack configuration.
+    Handles:
+    - Naming using either an explicit `name` or a `name_suffix` appended to the
+      shared `network_resource_prefix`.
+    - Destination prefixes via `resolve_address_prefix`, which allows literal
+      CIDRs, computed refs, or dotted config paths.
+    - Next-hop IPs via `next_hop_ip_ref` ('trust_nic' / 'untrust_nic') so that
+      routes automatically follow the deployed firewall NIC addresses.
+    """
+    out = []
+    for route in route_list:
+        name = route.get("name") or (str(network_resource_prefix) + route["name_suffix"])
+        address_prefix = resolve_address_prefix(route, address_refs, cfg)
+        next_hop_type = route["next_hop_type"]
+        next_hop_ip_address = None
+        if route.get("next_hop_ip_ref") == "trust_nic":
+            next_hop_ip_address = trust_nic_ip
+        elif route.get("next_hop_ip_ref") == "untrust_nic":
+            next_hop_ip_address = untrust_nic_ip
+        kwargs = dict(name=name, address_prefix=address_prefix, next_hop_type=next_hop_type)
+        if next_hop_ip_address is not None:
+            kwargs["next_hop_ip_address"] = next_hop_ip_address
+        out.append(azure_native.network.RouteArgs(**kwargs))
+    return out
+
+def resolve_address_prefix(route_def, address_refs, cfg):
+    """Resolve a route's address prefix from literal, computed ref, or config path."""
+    if "address_prefix" in route_def:
+        return route_def["address_prefix"]
+    ref = route_def["address_prefix_ref"]
+    if ref in address_refs:
+        return address_refs[ref]
+    return resolve_config_path(cfg, ref)
+
+def resolve_config_path(cfg, path):
+    """Resolve a dotted config path from Pulumi stack YAML."""
+    segments = path.split(".")
+    key = segments[0]
+    if len(segments) == 1:
+        return cfg.require(key)
+    obj = cfg.require_object(key)
+    for segment in segments[1:]:
+        if segment.isdigit():
+            obj = obj[int(segment)]
+        else:
+            obj = obj[segment]
+    return obj
+
+def resolve_nsg_address(rule: dict, prefix_key: str, cfg) -> str:
+    """Resolve source or destination address for an NSG rule.
+    If `<prefix_key>_ref` is present (e.g. `source_address_prefix_ref`), the
+    value is treated as a Pulumi config key and loaded via `cfg.require`.
+    Otherwise the literal `<prefix_key>` value is returned.
+    """
+    ref_key = prefix_key + "_ref"
+    if ref_key in rule:
+        return cfg.require(rule[ref_key])
+    return rule[prefix_key]
+######################## Stack Configuration ########################
+# Grab variables from Pulumi.<stack>.yaml
+cfg                          = pulumi.Config()
+cfg_az                       = pulumi.Config("azure-native")
+network_resource_prefix      = cfg.require("network_resource_prefix")
+spoke_prefix                 = cfg.require("spoke_prefix")
+vnet1_cidr                   = cfg.require("vnet1_cidr")
+on_prem_source_ip_range      = cfg.require("on_prem_source_ip_range")
+pa_hub_stack                 = cfg.require("pa_hub_stack")
+config_route_tables          = cfg.require_object("route_tables")
+
+# Additional Hub NSG rules optional
+try:
+    raw_nsg_rules = cfg.get_object("nsg_rules")
+    config_nsg_rules = raw_nsg_rules if isinstance(raw_nsg_rules, list) else []
+except Exception:
+    config_nsg_rules = []
+
+# Stack reference to azure-pa-hub-network (e.g. org/azure-pa-hub-network/dev)
+hub_stack = StackReference(pa_hub_stack)
+trust_nic_private_ip = hub_stack.get_output("trust_nic_private_ip")
+untrust_nic_private_ip = hub_stack.get_output("untrust_nic_private_ip")
+
+######################## Peerings ########################
+try:
+    raw_peerings = cfg.get_object("peerings")
+    config_peerings = raw_peerings if isinstance(raw_peerings, list) else []
+except Exception:
+    config_peerings = []
 
 # Create an Azure Resource Group
-resource_group = resources.ResourceGroup(str(rg_prefix) + "-Networking",
-    resource_group_name=str(rg_prefix) + "-Networking")
+networking_resource_group= resources.ResourceGroup(str(network_resource_prefix) + "-Networking",
+    resource_group_name=str(network_resource_prefix) + "-Networking")
 
-VM1_resource_group = resources.ResourceGroup(str(rg_prefix) + "-" + str(vm1_vm_name) + "-VM",
-    resource_group_name=str(rg_prefix) + "-" + str(vm1_vm_name) + "-VM",
-)
-
-# Create Route Table
-VnetToFw_route_table = azure_native.network.RouteTable(str(rg_prefix) + "-to-FW",
-    route_table_name=str(rg_prefix) + "-to-FW",
-    location=resource_group.location,
-    resource_group_name=resource_group.name,
+# Create Route Table (routes from route_tables.VnetToFw in Pulumi.<stack>.yaml)
+vnet_to_fw_route_table = azure_native.network.RouteTable(str(network_resource_prefix) + "-to-FW",
+    opts=pulumi.ResourceOptions(depends_on=[networking_resource_group]),
+    route_table_name=str(network_resource_prefix) + "-to-FW",
+    location=networking_resource_group.location,
+    resource_group_name=networking_resource_group.name,
     disable_bgp_route_propagation=False,
-    routes=[
-        azure_native.network.RouteArgs(name=str(vnet1_prefix) + "-to-FW-Route1",
-        address_prefix="0.0.0.0/0",
-        next_hop_type="VirtualAppliance",
-        next_hop_ip_address=trust_network_interface),
-
-        azure_native.network.RouteArgs(name=str(vnet1_prefix) + "-to-FW-Route2",
-        address_prefix=on_prem_source_ip_range,
-        next_hop_type="VirtualNetworkGateway"),
-
-        azure_native.network.RouteArgs(name=str(vnet1_prefix) + "-to-FW-Route3",
-        address_prefix="xx.xx.xx.xx/16",
-        next_hop_type="VirtualNetworkGateway"),
-
-        azure_native.network.RouteArgs(name=str(vnet1_prefix) + "-to-FW-Route4",
-        address_prefix="xx.xx.xx.xx/12",
-        next_hop_type="VirtualNetworkGateway"),
-
-        azure_native.network.RouteArgs(name=str(vnet1_prefix) + "-to-FW-Route5",
-        address_prefix=hub_cidr,
-        next_hop_type="VirtualAppliance",
-        next_hop_ip_address=trust_network_interface),
-        
-    ])
-# Create Default Network Security Group
-vnet_network_security_group = azure_native.network.NetworkSecurityGroup(str(vnet1_prefix) + "-nsg",
-    network_security_group_name=str(vnet1_prefix) + "-nsg",
-    location=resource_group.location,
-    resource_group_name=resource_group.name,
-    security_rules=[azure_classic.network.NetworkSecurityGroupSecurityRuleArgs(
-        name="Allow-Outside-From-IP",
-        description="Rule",
-        protocol="*",
-        source_port_range="*",
-        destination_port_range="*",
-        source_address_prefix=on_prem_source_ip_range,
-        destination_address_prefix="*",
-        access="Allow",
-        priority=100,
-        direction="Inbound"),
-        
-        azure_classic.network.NetworkSecurityGroupSecurityRuleArgs(
-        name="Allow-Intra",
-        description="Allow intra network traffic",
-        protocol="*",
-        source_port_range="*",
-        destination_port_range="*",
-        source_address_prefix=vnet1_cidr,
-        destination_address_prefix="*",
-        access="Allow",
-        priority=101,
-        direction="Inbound"),    
-
-        azure_classic.network.NetworkSecurityGroupSecurityRuleArgs(
-        name="Default-Deny",
-        description="Deny if we don't match Allow rule",
-        protocol="*",
-        source_port_range="*",
-        destination_port_range="*",
-        source_address_prefix="*",
-        destination_address_prefix="*",
-        access="Deny",
-        priority=200,
-        direction="Inbound"), 
-    ],
+    routes=build_routes(
+        config_route_tables["VnetToFw"],
+        network_resource_prefix,
+        {},
+        trust_nic_private_ip,
+        untrust_nic_private_ip,
+        cfg,
+    ),
+)
+# Create NSG: custom rules from nsg_rules when non-empty; omit security_rules when [] / missing (Azure defaults only).
+spoke_network_security_group = azure_classic.network.NetworkSecurityGroup(str(spoke_prefix) + "-NSG",
+    opts=pulumi.ResourceOptions(depends_on=[networking_resource_group]),
+    name=str(spoke_prefix) + "-NSG",
+    location=networking_resource_group.location,
+    resource_group_name=networking_resource_group.name,
+    **({"security_rules": build_hub_nsg_rules(config_nsg_rules, cfg)} if config_nsg_rules else {}),
 )
 
 # Create a VNET with one Subnet
-vnet1 = azure_native.network.VirtualNetwork(str(vnet1_prefix) + "-VNET",
-    virtual_network_name=str(vnet1_prefix) + "-VNET",
+vnet1 = azure_native.network.VirtualNetwork(str(spoke_prefix) + "-VNET",
+    virtual_network_name=str(spoke_prefix) + "-VNET",
     address_space=azure_native.network.AddressSpaceArgs(address_prefixes=[vnet1_cidr]),
-    location=resource_group.location,
-    resource_group_name=resource_group.name,
+    location=networking_resource_group.location,
+    resource_group_name=networking_resource_group.name,
     subnets=[
         azure_native.network.SubnetArgs(
-            name=str(vnet1_prefix) + "-subnet1",
+            name=str(spoke_prefix) + "-subnet1",
             address_prefix=vnet1_cidr)
     ])
 
 # Associate Network Security Group
-subnet_network_security_group_association = azure_classic.network.SubnetNetworkSecurityGroupAssociation("DefaultNetworkSecurityGroupAssociation",
+vnet1_network_security_group_association = azure_classic.network.SubnetNetworkSecurityGroupAssociation("DefaultNetworkSecurityGroupAssociation",
     subnet_id=vnet1.subnets[0].id,
-    network_security_group_id=vnet_network_security_group.id)
+    opts=pulumi.ResourceOptions(depends_on=[spoke_network_security_group, vnet1]),
+    network_security_group_id=spoke_network_security_group.id)
 
 # Associate Route Table
-subnet_route_table_association = azure_classic.network.SubnetRouteTableAssociation("VnetRouteTableAssociation",
+vnet1_route_table_association = azure_classic.network.SubnetRouteTableAssociation("VnetRouteTableAssociation",
     subnet_id=vnet1.subnets[0].id,
-    route_table_id=VnetToFw_route_table.id)
+    opts=pulumi.ResourceOptions(depends_on=[vnet_to_fw_route_table,vnet1]),
+    route_table_id=vnet_to_fw_route_table.id)
 
-# Create VNET-to-HUB Peering
-vnet_virtual_network_peering = azure_native.network.VirtualNetworkPeering("DEV-WEST1-to-HUB",
-    allow_forwarded_traffic=True,
-    allow_gateway_transit=False,
-    allow_virtual_network_access=True,
-    remote_virtual_network=azure_native.network.SubResourceArgs(
-        id=hub_vnet_id,
-    ),
-    resource_group_name=resource_group.name,
-    use_remote_gateways=True,
-    virtual_network_name=vnet1.name,
-    virtual_network_peering_name=str(vnet1_prefix) + "-VNET-to-HUB")
-
-# Keeping around for testing
-VM1_public_ip = azure_classic.network.PublicIp(str(vm1_vm_name) + "-Public-IP",
-    opts=pulumi.ResourceOptions(depends_on=[VM1_resource_group]),
-    name=str(vm1_vm_name) + "-Public-IP",
-    resource_group_name=VM1_resource_group.name,
-    location=VM1_resource_group.location,
-    sku="Standard",
-    sku_tier="Regional",
-    allocation_method="Static",
-    ip_version="IPv4",
-    idle_timeout_in_minutes = 4,
-    domain_name_label=str(vm1_vm_name),
-)
-
-# VM 1 Network interface
-VM1_network_interface = azure_classic.network.NetworkInterface(str(vm1_vm_name) + "-eth0",
-    #opts=pulumi.ResourceOptions(depends_on=[vnet1]),
-    opts=pulumi.ResourceOptions(depends_on=[vnet1,VM1_public_ip]),
-    name=str(vm1_vm_name) + "-eth0",
-    location=VM1_resource_group.location,
-    resource_group_name=VM1_resource_group.name,
-    ip_configurations=[azure_classic.network.NetworkInterfaceIpConfigurationArgs(
-        name="ipconfig1-" + str(vm1_vm_name),
-        primary=True,
-        subnet_id=vnet1.subnets[0].id,
-        public_ip_address_id=VM1_public_ip.id, # For testing   
-        private_ip_address_allocation="Dynamic",
-        private_ip_address_version="IPv4")],
-)
-
-# VM 1 Virtual Machine
-VM1_virtual_machine = azure_classic.compute.VirtualMachine(
-    str(vm1_vm_name),
-    opts=pulumi.ResourceOptions(depends_on=[VM1_network_interface]),
-    name=str(vm1_vm_name),
-    location=VM1_resource_group.location,
-    resource_group_name=VM1_resource_group.name,
-    network_interface_ids=[VM1_network_interface.id],
-    primary_network_interface_id=VM1_network_interface.id,
-    vm_size="Standard_A2_v2",
-
-    storage_image_reference=azure_classic.compute.VirtualMachineStorageImageReferenceArgs(
-        publisher="canonical",
-        offer="ubuntu-24_04-lts",
-        sku="minimal-gen1",
-        version="latest",
-    ),
-
-    storage_os_disk=azure_classic.compute.VirtualMachineStorageOsDiskArgs(
-        name=str(vm1_vm_name) + "_OsDisk_1",
-        caching="ReadWrite",
-        create_option="FromImage",
-        managed_disk_type="Standard_LRS",
-        os_type="Linux",
-    ),
-
-    os_profile=azure_classic.compute.VirtualMachineOsProfileArgs(
-        computer_name=str(vm1_vm_name),
-        admin_username=str(vm1_admin_username),
-        admin_password=str(vm1_admin_password),
-    ),
-
-    os_profile_linux_config=azure_classic.compute.VirtualMachineOsProfileLinuxConfigArgs(
-        disable_password_authentication=False
-    ),
-)
+# VNET peerings from Pulumi.<stack>.yaml (list: name, remote_vnet_id, cidr). Create only when list has items.
+vnet_peerings = []
+if config_peerings:
+    for i, p in enumerate(config_peerings):
+        peering = azure_native.network.VirtualNetworkPeering(p["name"],
+            virtual_network_peering_name=p["name"],
+            allow_forwarded_traffic=True,
+            allow_gateway_transit=False,
+            allow_virtual_network_access=True,
+            remote_virtual_network=azure_native.network.SubResourceArgs(id=p["remote_vnet_id"]),
+            resource_group_name=networking_resource_group.name,
+            use_remote_gateways=True,
+            virtual_network_name=vnet1.name,
+        )
+        vnet_peerings.append(peering)
 
 # Export VNET CIDR Block
-pulumi.export(str(vnet1_prefix) + "-VNET", vnet1_cidr)
-pulumi.export("VM 1 Hostname", vm1_vm_name)
-pulumi.export(str(vm1_vm_name) + " Private IP", VM1_network_interface.private_ip_address)
-pulumi.export(str(vm1_vm_name) + "-Public-IP FQDN", VM1_public_ip.fqdn)
-pulumi.export(str(vm1_vm_name) + "-Public-IP", VM1_public_ip.ip_address.apply(lambda v: v or "pending…"))
-pulumi.export("DEV-WEST1-to-HUB Peering CIDR", hub_cidr)
+pulumi.export(str(spoke_prefix) + "-VNET", vnet1_cidr)
+for p in config_peerings:
+    pulumi.export(f"{p['name']} Peering CIDR", p["cidr"])
