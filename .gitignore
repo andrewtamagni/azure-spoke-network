@@ -1,0 +1,5 @@
+__pycache__/
+*.json
+Pulumi.*.yaml
+# Allow the sanitized example to be committed to GitHub
+!Pulumi.sample.yaml
