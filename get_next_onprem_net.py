@@ -1,216 +1,322 @@
-# This script gets all the available VNETs that connect from on-prem to one of the Cloud Providers.
-# You must be logged into the applicable Azure CLI with valid credentials before running this script!
+#!/usr/bin/env python3
+# Get the next available on-prem connecting subnet from the stack's cloud_network_space (Azure).
+# Run from the project root. You must be logged into Azure CLI with valid credentials.
+#
+# Usage: python get_next_onprem_net.py MASK [--stack STACK]
+#   MASK: /24, /25, /26, /27, /28, or /29
+#   --stack: optional; required if more than one stack has a local config. Use 'dev' or 'org/dev'.
+#
+# Developed 12/2021 by Andrew Tamagni
+# Updated 10/22/2025: Pulumi stack support
+# Updated 03/2026: stack based on --stack argument
 
-# Developed on 12/2021 by Andrew Tamagni - UCAR STO
-# Updated 10/22/2025 by Andrew Tamagni - UCAR STO: Added Pulumi stack support
-
-# install the Python Azure CLI
-# pip install azure-cli
-
+import argparse
+import ipaddress
+import json
 import os
 import re
 import subprocess
 import sys
 import yaml
-import pulumi
-import argparse
-import ipaddress
-import subprocess
 
-try:
-    cfg = pulumi.Config()
-    config_cloud_network_spaces = cfg.require_object("cloud_network_spaces")
-    # Try to get cloud_network_env from config
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+CIDR_CHOICES = ["/24", "/25", "/26", "/27", "/28", "/29"]
+
+# ANSI color codes (disabled when stdout is not a TTY). Same scheme as create_keyvault.py / stack_menu.py.
+COLOR_RESET = "\033[0m"
+COLOR_GREEN = "\033[32m"
+COLOR_CYAN = "\033[36m"
+COLOR_ORANGE = "\033[33m"
+COLOR_RED = "\033[31m"
+
+
+def color_enabled() -> bool:
+    """Return True if we should emit ANSI colors (terminal supports it)."""
     try:
-        config_cloud_network_env = cfg.get("cloud_network_env")
+        return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     except Exception:
-        config_cloud_network_env = None
-except Exception:
-    # Fallback when not running under `pulumi up`
-    try:
-        with open("Pulumi.yaml", "r", encoding="utf-8") as f:
-            project = yaml.safe_load(f)["name"]
+        return False
 
-        stack = os.getenv("PULUMI_STACK")
-        if not stack:
-            try:
-                out = subprocess.run(["pulumi", "stack"], check=True, capture_output=True, text=True).stdout
-                stack = re.search(r"Current stack is ([^\s:]+):", out).group(1).split("/", 1)[-1]
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # If pulumi command fails, try to find stack files
-                stack_files = [f for f in os.listdir(".") if f.startswith("Pulumi.") and f.endswith(".yaml")]
-                if stack_files:
-                    stack = stack_files[0].replace("Pulumi.", "").replace(".yaml", "")
-                else:
-                    raise Exception("No Pulumi stack found")
 
-        with open(f"Pulumi.{stack}.yaml", "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f) or {}
-
-        config_cloud_network_spaces = y["config"][f"{project}:cloud_network_spaces"]
-        # Try to get cloud_network_env from config
-        config_cloud_network_env = y["config"].get(f"{project}:cloud_network_env")
-    except Exception as e:
-        print(f"Error loading Pulumi configuration: {e}")
-        print("Please ensure you are in a Pulumi project directory with valid configuration files.")
-        sys.exit(1)
-
-# Read in all variables from the Pulumi.<stack>.yaml file
-azure_prod_address_space = config_cloud_network_spaces["azure_prod"]["vnet_cidr"]
-azure_test_address_space = config_cloud_network_spaces["azure_test"]["vnet_cidr"]
-#aws_prod_address_space = config_cloud_network_spaces.require_object('aws_prod')
-#aws_test_address_space = config_cloud_network_spaces.require_object('aws_test')
-#gcp_prod_address_space = config_cloud_network_spaces.require_object('gcp_prod')
-#gcp_test_address_space = config_cloud_network_spaces.require_object('gcp_test')
-
-# Create a parser to display help message and validate arguments
-def parse_arguments():
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('CloudProvider', nargs='?', default=None,
-        help="""
-        Enter Cloud Provider (optional - will try to get from cloud_network_env config first)
-
-        Examples:
-
-        python GetAvailableCloudSubnets.py /28  (uses cloud_network_env from config)
-        python GetAvailableCloudSubnets.py azure /28
-        python GetAvailableCloudSubnets.py gcp /28
-        python GetAvailableCloudSubnets.py aws-test /28
-        """,
-        choices=["azure","azure-test","aws","aws-test","gcp","gcp-test"])
-    parser.add_argument(dest='MaskBits',
-        help="""
-        Please enter the argument for Subnet Mask Bits or number of host IPs needed for the network.
-
-        Examples for getting a /28 Subnet with 14 availible hosts:
-    
-        python GetAvailableCloudSubnets.py /28  (uses cloud_network_env from config)
-        python GetAvailableCloudSubnets.py azure /28
-
-        Availible Network CIDR sizes include:
-
-        /24 with 254 Host IPs
-        /25 with 126 Host IPs
-        /26 with 62 Host IPs
-        /27 with 30 Host IPs
-        /28 with 14 Host IPs
-        /29 with 6 Host IPs""",
-        choices=["/24","/25","/26","/27","/28","/29"])
-    args = parser.parse_args()
-    return args
-
-def GetAvailableSubnets(AddressSpace,ExistingVnets,MaskBits):
-    global result
-    AvailableVnets = [] # Empty array for availible VNETs
-    ExistingVnets = ExistingVnets.split(",") # Split ExistingVnets argument
-    PossibleNetworks = list(ipaddress.ip_network(AddressSpace).subnets(new_prefix=MaskBits)) # All possible VNETs for the MaskBits argument
-    AddressSpaceIPs = list(ipaddress.ip_network(AddressSpace)) # All possible IPs in an AddressSpace    
-
-    # Check if Array for existing VNETs is empty.  If it isn't, remove All Vnet possible IPs from AddressSpaceIPs
-    if (ExistingVnets != ['']):
-        for Vnet in ExistingVnets:
-            ipVnet = ipaddress.ip_network(Vnet)
-            for ip in ipVnet:
-                if ipaddress.IPv4Address(ip) in AddressSpaceIPs:
-                    AddressSpaceIPs.remove(ipaddress.IPv4Address(ip))
-
-    # Iterate through all possible networks.  Select only networks that have all IPs availible 
-    for PossibleNetwork in PossibleNetworks:
-        hosts = list(ipaddress.ip_network(PossibleNetwork).hosts())
-        check = all(item in AddressSpaceIPs for item in hosts)
-        #print(PossibleNetwork)
-        #print(check)
-        if check == True:
-            AvailableVnets.append(str(PossibleNetwork))
-
-    # Return the first available VNET and generate a warning if there are no VNETs available for the requested size       
-    if (AvailableVnets != []):
-        # Return only the first availible VNET
-        result = ipaddress.ip_network(AvailableVnets[0])
-        return result        
+def msg(text: str, color_code: str | None = None) -> None:
+    """Print message to stdout with optional color."""
+    if color_code and color_enabled():
+        print(f"{color_code}{text}{COLOR_RESET}")
     else:
-        print('There are no more /%d' %MaskBits,"Networks Available")
-        sys.exit(1)
+        print(text)
 
-# Get all the current networks being used in an Azure tenant by setting the AzureAddressSpaces variable.
-def GetAzureOnPremVnets(AzureAddressSpace,MaskBits):
-    # Load Azure Modules
-    from azure.identity import DefaultAzureCredential
+
+def msg_stderr(text: str, color_code: str | None = None) -> None:
+    """Print message to stderr with optional color (e.g. for error output)."""
+    if color_code and color_enabled():
+        print(f"{color_code}{text}{COLOR_RESET}", file=sys.stderr)
+    else:
+        print(text, file=sys.stderr)
+
+
+def fail(text: str) -> None:
+    """Print an error message and exit with status 1."""
+    msg_stderr(f"ERROR : {text}", COLOR_RED)
+    raise SystemExit(1)
+
+
+# -----------------------------------------------------------------------------
+# Project and stack helpers
+# -----------------------------------------------------------------------------
+
+
+def get_project_name() -> str:
+    """Load project name from Pulumi.yaml in cwd."""
+    path = "Pulumi.yaml"
+    if not os.path.isfile(path):
+        fail(f"Not a Pulumi project directory: {path} not found.")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    name = (data or {}).get("name")
+    if not name:
+        fail(f"{path} is missing a 'name' field.")
+    return str(name).strip()
+
+
+def discover_local_stacks() -> list[dict]:
+    """
+    Discover stacks that have a local Pulumi.<stack>.yaml file.
+    Returns list of dicts: full_name, basename, stack_file.
+    """
+    # Keep the committed example stack config (Pulumi.sample.yaml) out of discovery.
+    # Treat it as documentation, not a real stack to operate on.
+    SAMPLE_STACK_BASENAME = "sample"
+
+    stacks = []
+    # Prefer Pulumi CLI so we get org/stack names.
+    try:
+        result = subprocess.run(
+            ["pulumi", "stack", "ls", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+        )
+        data = json.loads(result.stdout or "[]")
+        for entry in data:
+            full_name = (entry.get("name") or "").strip()
+            if not full_name:
+                continue
+            basename = full_name.split("/")[-1]
+            if basename == SAMPLE_STACK_BASENAME:
+                continue
+            stack_file = f"Pulumi.{basename}.yaml"
+            if os.path.isfile(stack_file):
+                stacks.append({"full_name": full_name, "basename": basename, "stack_file": stack_file})
+    except Exception:
+        pass
+    if not stacks:
+        # Fallback: local files only.
+        for fname in sorted(os.listdir(".")):
+            if not fname.startswith("Pulumi.") or not fname.endswith(".yaml") or fname == "Pulumi.yaml":
+                continue
+            basename = fname.replace("Pulumi.", "").replace(".yaml", "")
+            if basename == SAMPLE_STACK_BASENAME:
+                continue
+            stacks.append({"full_name": basename, "basename": basename, "stack_file": fname})
+    return stacks
+
+
+def load_cloud_network_space(stack_file: str, project: str) -> dict | None:
+    """Load cloud_network_space (name, cidr) from a stack config file. Returns None if missing/invalid."""
+    if not os.path.isfile(stack_file):
+        return None
+    with open(stack_file, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    config = data.get("config") or {}
+    key = f"{project}:cloud_network_space"
+    value = config.get(key) or config.get("cloud_network_space")
+    if not isinstance(value, dict):
+        return None
+    name = (value.get("name") or "").strip()
+    cidr = (value.get("cidr") or "").strip()
+    if name and cidr:
+        return {"name": name, "cidr": cidr}
+    return None
+
+
+def resolve_stack(stacks: list[dict], stack_arg: str | None) -> dict:
+    """
+    Resolve which stack to use. If stack_arg is None, use the only stack (or fail).
+    stack_arg can be full name (org/dev) or basename (dev).
+    """
+    if not stacks:
+        fail("No Pulumi stacks found. Create a stack and ensure Pulumi.<stack>.yaml exists in this directory.")
+    if len(stacks) == 1:
+        if stack_arg and stack_arg != stacks[0]["full_name"] and stack_arg != stacks[0]["basename"]:
+            fail(f"Only one stack is available ({stacks[0]['full_name']}); --stack must match it.")
+        return stacks[0]
+    # Multiple stacks: --stack required.
+    if not stack_arg:
+        msg_stderr("More than one stack has a local config. Specify which stack with --stack.", COLOR_ORANGE)
+        msg_stderr("Example: --stack dev  or  --stack org/dev", COLOR_ORANGE)
+        fail("Missing --stack argument.")
+    stack_arg = stack_arg.strip()
+    for s in stacks:
+        if stack_arg == s["full_name"] or stack_arg == s["basename"]:
+            return s
+    fail(f"No stack matching {stack_arg!r}. Available: {', '.join(s['full_name'] for s in stacks)}")
+
+
+# -----------------------------------------------------------------------------
+# Core logic (Azure only; tied to stack cloud_network_space)
+# -----------------------------------------------------------------------------
+
+result = None
+
+
+def get_available_subnets(address_space: str, existing_vnets: str, mask_bits: int) -> ipaddress.IPv4Network:
+    """Return the first available subnet of the given size in address_space excluding existing_vnets."""
+    global result
+    existing_list = existing_vnets.split(",") if existing_vnets else []
+    possible = list(ipaddress.ip_network(address_space).subnets(new_prefix=mask_bits))
+    address_space_ips = set(ipaddress.ip_network(address_space))
+
+    for vnet in existing_list:
+        if not vnet.strip():
+            continue
+        for ip in ipaddress.ip_network(vnet):
+            address_space_ips.discard(ip)
+
+    for candidate in possible:
+        hosts = list(ipaddress.ip_network(candidate).hosts())
+        if all(ip in address_space_ips for ip in hosts):
+            result = ipaddress.ip_network(candidate)
+            return result
+
+    fail(f"There are no more /{mask_bits} networks available in the configured address space.")
+
+
+def get_azure_onprem_vnets(azure_address_space: str, mask_bits: int) -> ipaddress.IPv4Network:
+    """Query Azure for VNETs in the address space and return the next available subnet."""
+    from azure.identity import AzureCliCredential
     from azure.mgmt.network import NetworkManagementClient
     from azure.mgmt.resource import ResourceManagementClient
     from azure.mgmt.resource import SubscriptionClient
 
-    AzureOnPremVnets = [] # Empty array for existing Azure networks that connect on-prem
-    subscription_client = SubscriptionClient(credential = DefaultAzureCredential(exclude_visual_studio_code_credential=True)) # Establish Subscription Client
+    credential = AzureCliCredential()
+    onprem_vnets = []
+    sub_client = SubscriptionClient(credential=credential)
+    target = ipaddress.ip_network(azure_address_space)
 
-    # Grab list of subscriptions and run nested FOR loops to grab
-    # the network address prefix for each
-    # Subscription / Resource Group / Resource / Microsoft.Network/virtualNetworks 
-    for subscription in subscription_client.subscriptions.list():
-        resource_client = ResourceManagementClient(DefaultAzureCredential(exclude_visual_studio_code_credential=True),subscription.subscription_id) # Establish Resource Client
-        network_client = NetworkManagementClient(DefaultAzureCredential(exclude_visual_studio_code_credential=True),subscription.subscription_id) # Establish Network Client
-        group_list = resource_client.resource_groups.list() # Grab the list of Resource Groups for each Subscription
+    for subscription in sub_client.subscriptions.list():
+        res_client = ResourceManagementClient(credential, subscription.subscription_id)
+        net_client = NetworkManagementClient(credential, subscription.subscription_id)
+        for group in res_client.resource_groups.list():
+            for resource in res_client.resources.list_by_resource_group(group.name):
+                if resource.type != "Microsoft.Network/virtualNetworks":
+                    continue
+                vnet = net_client.virtual_networks.get(group.name, resource.name)
+                for prefix in vnet.address_space.address_prefixes:
+                    if ipaddress.ip_network(prefix).subnet_of(target):
+                        onprem_vnets.append(prefix)
 
-        for group in group_list:
-            # Grab a list of all resources in a Resource Group
-            resource_list = resource_client.resources.list_by_resource_group(group.name)
-        
-            for resource in resource_list:
-                # Filter out only vnet resources
-                if (resource.type == "Microsoft.Network/virtualNetworks"):
-                    # Establish Network Client
-                    network = network_client.virtual_networks.get(group.name,resource.name)
-                    
-                    # Populate AzureOnPremVnets Array with all address prefixes                
-                    for vnet in network.address_space.address_prefixes:
-                        # Filter out networks that are not in OnPrem VNET 
-                        if ipaddress.ip_network(vnet).subnet_of(ipaddress.ip_network(AzureAddressSpace)):
-                            AzureOnPremVnets.append(vnet)
-    #Join array to pass as one argument
-    AzureOnPremVnets = ",".join(AzureOnPremVnets)
+    existing = ",".join(onprem_vnets)
+    return get_available_subnets(azure_address_space, existing, mask_bits)
 
-    # Run GetAvailableSubnets with the results
-    GetAvailableSubnets(AzureAddressSpace,AzureOnPremVnets,MaskBits)
 
-def GetAwsOnPremVnets(AwsAddressSpace,MaskBits):
+# -----------------------------------------------------------------------------
+# CLI and main entry
+# -----------------------------------------------------------------------------
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Get next available on-prem connecting subnet from the stack's cloud_network_space (Azure).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "mask",
+        metavar="MASK",
+        choices=CIDR_CHOICES,
+        help="Subnet mask: /24, /25, /26, /27, /28, or /29",
+    )
+    parser.add_argument(
+        "--stack",
+        metavar="STACK",
+        default=None,
+        help="Stack to use (e.g. dev or org/dev). Required if more than one stack has a local config.",
+    )
+    return parser.parse_args()
+
+
+def mask_to_int(mask: str) -> int:
+    """Convert /24 -> 24 etc."""
+    if mask in CIDR_CHOICES:
+        return int(mask.lstrip("/"))
+    fail(f"Invalid mask {mask!r}. Use one of: {', '.join(CIDR_CHOICES)}")
+
+
+def main(MaskBitSize: str, stack_identifier: str | None = None):
+    """
+    Get the next available on-prem subnet for the stack's cloud_network_space.
+    When called from __main__.py (Pulumi), stack_identifier is None and config is taken from
+    PULUMI_STACK + stack file or pulumi.Config(). When run as CLI, the caller resolves stack
+    and passes stack_identifier (full name) and loads config from file; this path is used
+    only for the return value from __main__.py.
+    """
     global result
-    result = "Script Ready for AWS Module"
-    return result
+    result = None
+    mask_bits = mask_to_int(MaskBitSize)
 
-def GetGcpOnPremVnets(GcpAddressSpace,MaskBits):
-    global result
-    result = "Script Ready for GCP Module"
-    return result
-
-def main(CloudProvider,MaskBitSize):    
-    # set MaskBits agrument
-    if ((MaskBitSize == "/29")):MaskBits = 29
-    if ((MaskBitSize == "/28")):MaskBits = 28
-    if ((MaskBitSize == "/27")):MaskBits = 27
-    if ((MaskBitSize == "/26")):MaskBits = 26
-    if ((MaskBitSize == "/25")):MaskBits = 25
-    if ((MaskBitSize == "/24")):MaskBits = 24
-
-    # If CloudProvider is not provided, try to get it from config
-    if CloudProvider is None:
-        if config_cloud_network_env:
-            CloudProvider = config_cloud_network_env
+    # Resolve config: from stack file (when stack_identifier or PULUMI_STACK set) or from Pulumi config.
+    cloud_network_space = None
+    if stack_identifier:
+        project = get_project_name()
+        stack_basename = stack_identifier.split("/")[-1]
+        stack_file = f"Pulumi.{stack_basename}.yaml"
+        cloud_network_space = load_cloud_network_space(stack_file, project)
+    else:
+        # PULUMI_STACK from env (when run under Pulumi or from stack_menu)
+        stack_env = os.environ.get("PULUMI_STACK", "").strip()
+        if stack_env:
+            project = get_project_name()
+            stack_basename = stack_env.split("/")[-1]
+            stack_file = f"Pulumi.{stack_basename}.yaml"
+            cloud_network_space = load_cloud_network_space(stack_file, project)
         else:
-            print("Error: CloudProvider argument is required when cloud_network_env is not set in Pulumi config")
-            print("Please provide CloudProvider as an argument or set cloud_network_env in your Pulumi config")
-            sys.exit(1)
+            try:
+                import pulumi
+                cfg = pulumi.Config()
+                # Nested object must be read with get_object(), not get()
+                cloud_network_space = cfg.get_object("cloud_network_space")
+            except Exception:
+                pass
 
-    ##### MAIN SCRIPT #####
-    if (CloudProvider == "azure"):GetAzureOnPremVnets(azure_prod_address_space,MaskBits)
-    if (CloudProvider == "azure-test"):GetAzureOnPremVnets(azure_test_address_space,MaskBits)
-    #if (CloudProvider == "aws"):GetAwsOnPremVnets(aws_prod_address_space,MaskBits)
-    #if (CloudProvider == "aws-test"):GetAwsOnPremVnets(aws_test_address_space,MaskBits)
-    #if (CloudProvider == "gcp"):GetGcpOnPremVnets(gcp_prod_address_space,MaskBits)
-    #if (CloudProvider == "gcp-test"):GetGcpOnPremVnets(gcp_test_address_space,MaskBits)
+    if not cloud_network_space or not isinstance(cloud_network_space, dict):
+        fail("cloud_network_space is not set for this stack. Add to Pulumi.<stack>.yaml:\n  cloud_network_space:\n    name: azure_test\n    cidr: 10.100.0.0/20")
 
+    cidr = (cloud_network_space.get("cidr") or "").strip()
+    if not cidr:
+        fail("cloud_network_space must have a 'cidr' field in Pulumi config.")
+
+    get_azure_onprem_vnets(cidr, mask_bits)
     return result
 
-# Allow the script to run from command prompt or be imported into another script as a module
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     args = parse_arguments()
-    print(main(args.CloudProvider,args.MaskBits))
+    project = get_project_name()
+    stacks = discover_local_stacks()
+    chosen = resolve_stack(stacks, args.stack)
+    space = load_cloud_network_space(chosen["stack_file"], project)
+    if not space:
+        fail(f"cloud_network_space (name, cidr) is not set in {chosen['stack_file']}. Add it to use this script.")
+    mask_bits = mask_to_int(args.mask)
+    msg(f"Stack: {chosen['full_name']}  mask: {args.mask}  address space: {space['cidr']}", COLOR_CYAN)
+    try:
+        out = main(args.mask, stack_identifier=chosen["full_name"])
+        msg(str(out), COLOR_GREEN)
+    except SystemExit:
+        raise
+    except Exception as e:
+        msg_stderr(str(e), COLOR_RED)
+        raise SystemExit(1)
