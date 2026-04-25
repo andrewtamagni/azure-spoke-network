@@ -1,0 +1,90 @@
+# -----------------------------------------------------------------------------
+# SAMPLE stack config for project "azure-spoke-network" (see Pulumi.yaml).
+# Create Pulumi.<yourstack>.yaml with stack_menu.py (Create new stack), or copy
+# this file to Pulumi.<yourstack>.yaml and replace ALL placeholder values with your
+# real subscription, tenant, addressing, ARM IDs, and hub stack name.
+#
+# No secrets belong in this file – this project does not manage Key Vault.
+# -----------------------------------------------------------------------------
+
+config:
+  # --- Azure provider / subscription (replace with your IDs) ---
+  azure:subscriptionId: 00000000-0000-0000-0000-000000000000
+  azure:tenantId: 00000000-0000-0000-0000-000000000000
+  azure-native:location: westus
+
+  # --- Core spoke networking consumed by __main__.py ---
+  azure-spoke-network:network_resource_prefix: TEST
+  azure-spoke-network:spoke_prefix: TEST-WESTUS
+  # Spoke address space / subnet CIDR; NSG rules may refer to this via vnet1_cidr
+  azure-spoke-network:vnet1_cidr: 10.10.5.0/24
+  # On-premise source range for NSG rules and routes
+  azure-spoke-network:on_prem_source_ip_range: 10.100.0.0/16
+
+  # Optional: parent space for get_next_onprem_net.py / menu helper
+  azure-spoke-network:cloud_network_space:
+    name: test_cloud_env
+    cidr: 10.200.0.0/20
+
+  # Stack reference to hub project (must export trust/untrust NIC private IPs)
+  azure-spoke-network:pa_hub_stack: org/azure-pa-hub-network/dev
+
+  # --- Required: at least one spoke→hub VNet peering (name, remote_vnet ARM id, hub-side CIDR for routes/exports) ---
+  azure-spoke-network:peerings:
+    - name: TEST-SPOKE-to-HUB
+      remote_vnet_id: /subscriptions/00000000-0000-4000-8000-000000000001/resourceGroups/TEST-Hub-RG/providers/Microsoft.Network/virtualNetworks/TEST-HUB-VNET
+      cidr: 10.200.4.0/24
+
+  # --- Route table: VnetToFw (see __main__.py build_routes) ---
+  azure-spoke-network:route_tables:
+    VnetToFw:
+      - name: TEST-to-FW-Route1
+        address_prefix: "0.0.0.0/0"
+        next_hop_type: VirtualAppliance
+        next_hop_ip_ref: trust_nic
+      - name: TEST-to-OnPremViaGw
+        address_prefix_ref: on_prem_source_ip_range
+        next_hop_type: VirtualNetworkGateway
+      - name: TEST-to-FW-Route2
+        address_prefix: "192.168.0.0/16"
+        next_hop_type: VirtualNetworkGateway
+      - name: TEST-to-FW-Route3
+        address_prefix: "172.16.0.0/12"
+        next_hop_type: VirtualNetworkGateway
+      - name: TEST-to-Hub-via-FW
+        address_prefix_ref: peerings.0.cidr
+        next_hop_type: VirtualAppliance
+        next_hop_ip_ref: trust_nic
+
+  # --- NSG rules for the spoke subnet (see __main__.py build_hub_nsg_rules) ---
+  azure-spoke-network:nsg_rules:
+    - name: Allow-Outside-From-IP
+      description: Allow from configured on-prem range ref
+      protocol: "*"
+      source_port_range: "*"
+      destination_port_range: "*"
+      source_address_prefix_ref: on_prem_source_ip_range
+      destination_address_prefix: "*"
+      access: Allow
+      priority: 100
+      direction: Inbound
+    - name: Allow-Intra
+      description: Allow intra-VNET traffic
+      protocol: "*"
+      source_port_range: "*"
+      destination_port_range: "*"
+      source_address_prefix_ref: vnet1_cidr
+      destination_address_prefix: "*"
+      access: Allow
+      priority: 101
+      direction: Inbound
+    - name: Default-Deny
+      description: Catch-all deny after Allow rules
+      protocol: "*"
+      source_port_range: "*"
+      destination_port_range: "*"
+      source_address_prefix: "*"
+      destination_address_prefix: "*"
+      access: Deny
+      priority: 200
+      direction: Inbound

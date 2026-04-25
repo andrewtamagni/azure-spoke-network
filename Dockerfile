@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM pulumi/pulumi-python:3.220.0
+FROM pulumi/pulumi-python:3.231.0
 ARG MNAME
 ARG PULUMI_ENVIRONMENT
 COPY requirements.txt ./

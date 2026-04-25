@@ -427,6 +427,9 @@ launch_shell() {
     if [ -n "$CONTAINER_NAME" ]; then
         run_args+=(--name "$CONTAINER_NAME")
     fi
+    # stack_menu.py can chown new Pulumi.<stack>.yaml on the bind mount to this user (process in container is root).
+    run_args+=(-e "HOST_UID=$(id -u)")
+    run_args+=(-e "HOST_GID=$(id -g)")
     run_args+=("${RUN_ENV_ARGS[@]}")
     run_args+=(-w /app)
     run_args+=(-v "${PWD}:/app")

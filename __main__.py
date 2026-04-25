@@ -2,16 +2,17 @@
 # Developed on 12/2021 by Andrew Tamagni
 # Updated 10/22/2025 by Andrew Tamagni - Converted Windows VM to Ubuntu VM.  Added Peering to Hub VNET.
 # Updated: Route tables, NSG rules, peerings from Pulumi.<stack>.yaml (config-driven, like azure-core-infrastructure).
+# Updated: Attach NSG and route table on the native VNet subnet (SubnetArgs) instead of classic Subnet*Association
+# resources, avoiding refresh/state drift between azure-native subnet ids and pulumi-azure associations.
 
 import pulumi
 from pulumi import StackReference
-from pulumi_azure_native import storage
+import pulumi_azure as azure_classic
 from pulumi_azure_native import resources
 import pulumi_azure_native as azure_native
-import pulumi_azure_native.network as azure_native_networking
-import pulumi_azure as azure_classic
 from azure.identity import AzureCliCredential
 from azure.keyvault.secrets import SecretClient
+import pulumi_azure_native.network as azure_native_networking
 from pulumi_azure_native.network import network_security_group
 from pulumi_azure_native.network.network_security_group import NetworkSecurityGroup
 
@@ -128,14 +129,20 @@ try:
 except Exception:
     config_peerings = []
 
+if not config_peerings:
+    raise ValueError(
+        "azure-spoke-network: 'peerings' must be a non-empty list (at least one VNet peering to the hub). "
+        "See Pulumi.sample.yaml."
+    )
+
 # Create an Azure Resource Group
 networking_resource_group= resources.ResourceGroup(str(network_resource_prefix) + "-Networking",
     resource_group_name=str(network_resource_prefix) + "-Networking")
 
 # Create Route Table (routes from route_tables.VnetToFw in Pulumi.<stack>.yaml)
-vnet_to_fw_route_table = azure_native.network.RouteTable(str(network_resource_prefix) + "-to-FW",
+vnet_to_fw_route_table = azure_native.network.RouteTable(str(spoke_prefix) + "-to-FW",
     opts=pulumi.ResourceOptions(depends_on=[networking_resource_group]),
-    route_table_name=str(network_resource_prefix) + "-to-FW",
+    route_table_name=str(spoke_prefix) + "-to-FW",
     location=networking_resource_group.location,
     resource_group_name=networking_resource_group.name,
     disable_bgp_route_propagation=False,
@@ -157,8 +164,10 @@ spoke_network_security_group = azure_classic.network.NetworkSecurityGroup(str(sp
     **({"security_rules": build_hub_nsg_rules(config_nsg_rules, cfg)} if config_nsg_rules else {}),
 )
 
-# Create a VNET with one Subnet
+# Create a VNET with one Subnet (NSG + route table on the subnet object — same ARM model as the portal;
+# avoids classic SubnetNetworkSecurityGroupAssociation / SubnetRouteTableAssociation + native subnet id mismatch.)
 vnet1 = azure_native.network.VirtualNetwork(str(spoke_prefix) + "-VNET",
+    opts=pulumi.ResourceOptions(depends_on=[spoke_network_security_group, vnet_to_fw_route_table]),
     virtual_network_name=str(spoke_prefix) + "-VNET",
     address_space=azure_native.network.AddressSpaceArgs(address_prefixes=[vnet1_cidr]),
     location=networking_resource_group.location,
@@ -166,22 +175,18 @@ vnet1 = azure_native.network.VirtualNetwork(str(spoke_prefix) + "-VNET",
     subnets=[
         azure_native.network.SubnetArgs(
             name=str(spoke_prefix) + "-subnet1",
-            address_prefix=vnet1_cidr)
-    ])
+            address_prefix=vnet1_cidr,
+            network_security_group=azure_native.network.NetworkSecurityGroupArgs(
+                id=spoke_network_security_group.id,
+            ),
+            route_table=azure_native.network.RouteTableArgs(
+                id=vnet_to_fw_route_table.id,
+            ),
+        ),
+    ],
+)
 
-# Associate Network Security Group
-vnet1_network_security_group_association = azure_classic.network.SubnetNetworkSecurityGroupAssociation("DefaultNetworkSecurityGroupAssociation",
-    subnet_id=vnet1.subnets[0].id,
-    opts=pulumi.ResourceOptions(depends_on=[spoke_network_security_group, vnet1]),
-    network_security_group_id=spoke_network_security_group.id)
-
-# Associate Route Table
-vnet1_route_table_association = azure_classic.network.SubnetRouteTableAssociation("VnetRouteTableAssociation",
-    subnet_id=vnet1.subnets[0].id,
-    opts=pulumi.ResourceOptions(depends_on=[vnet_to_fw_route_table,vnet1]),
-    route_table_id=vnet_to_fw_route_table.id)
-
-# VNET peerings from Pulumi.<stack>.yaml (list: name, remote_vnet_id, cidr). Create only when list has items.
+# VNET peerings from Pulumi.<stack>.yaml (list: name, remote_vnet_id, cidr); non-empty list is required.
 vnet_peerings = []
 if config_peerings:
     for i, p in enumerate(config_peerings):
@@ -197,7 +202,8 @@ if config_peerings:
         )
         vnet_peerings.append(peering)
 
-# Export VNET CIDR Block
+# Export VNET CIDR Block and subnet ID for consumers (e.g. azure-dev-vms).
 pulumi.export(str(spoke_prefix) + "-VNET", vnet1_cidr)
+pulumi.export(str(spoke_prefix) + "-subnet1-id", vnet1.subnets[0].id)
 for p in config_peerings:
     pulumi.export(f"{p['name']} Peering CIDR", p["cidr"])

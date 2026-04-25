@@ -1,4 +1,4 @@
-# Merge source for stack_menu.py: seeds Pulumi.<stack>.yaml with __REQUIRED__ / __OPTIONAL__ / __SECRET__.
+# Reference: __REQUIRED__ / __OPTIONAL__ vs __main__.py. stack_menu checklist/seeding uses Pulumi.sample.yaml.
 # Keys without a provider prefix are namespaced with the project name from Pulumi.yaml (e.g. azure-spoke-network:...).
 
 # --- Azure providers ---
@@ -10,14 +10,15 @@ azure-native:location: __REQUIRED__
 network_resource_prefix: __REQUIRED__   # e.g. DEV-ORG — RG name {prefix}-Networking, route table {prefix}-to-FW
 spoke_prefix: __REQUIRED__             # e.g. DEV-ORG-WEST1 — VNet {prefix}-VNET, subnet {prefix}-subnet1
 vnet1_cidr: __REQUIRED__                # Spoke address space / subnet CIDR; use as NSG *_ref target (vnet1_cidr)
-on_prem_source_ip_range: 128.117.0.0/16
+on_prem_source_ip_range: __REQUIRED__
 pa_hub_stack: __REQUIRED__             # StackReference, e.g. org/azure-pa-hub-network/dev (trust/untrust NIC outputs)
 
-# --- Route table and NSG (required shape for deploy; use stack_menu templates or copy from Pulumi.dev-eip.yaml) ---
+# --- Route table and NSG (required shape for deploy; use stack_menu templates or copy from an existing stack YAML) ---
 route_tables: __REQUIRED__              # Object with at least VnetToFw[] (see __main__.py / README)
 nsg_rules: __OPTIONAL__                 # Classic NSG rules list; omit or [] for Azure defaults only
 
+# --- Hub VNet peering (required for spoke stacks) ---
+peerings: __REQUIRED__                  # Non-empty list of { name, remote_vnet_id, cidr } (at least one hub peering)
+
 # --- Optional ---
-peerings: __OPTIONAL__                  # List of { name, remote_vnet_id, cidr }; omit if no hub peering yet
-# Same shape as azure-pa-hub-network:cloud_network_space — used by get_next_onprem_net.py / stack_menu on-prem helper
-cloud_network_space: __OPTIONAL__        # e.g. { name: "azure_test", cidr: "10.100.0.0/20" }
+cloud_network_space: __OPTIONAL__        # { name, cidr } — on-prem menu / get_next_onprem_net.py only; omit if unused

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Get the next available on-prem connecting subnet from the stack's cloud_network_space (Azure).
+# Spoke stacks may omit cloud_network_space unless you use this tool; add it under
+# azure-spoke-network:cloud_network_space (name + cidr) in Pulumi.<stack>.yaml when needed.
 # Run from the project root. You must be logged into Azure CLI with valid credentials.
 #
 # Usage: python get_next_onprem_net.py MASK [--stack STACK]
@@ -292,7 +294,13 @@ def main(MaskBitSize: str, stack_identifier: str | None = None):
                 pass
 
     if not cloud_network_space or not isinstance(cloud_network_space, dict):
-        fail("cloud_network_space is not set for this stack. Add to Pulumi.<stack>.yaml:\n  cloud_network_space:\n    name: azure_test\n    cidr: 10.100.0.0/20")
+        fail(
+            "cloud_network_space is not set for this stack (required for this script only). "
+            "Add to Pulumi.<stack>.yaml, for example:\n"
+            "  azure-spoke-network:cloud_network_space:\n"
+            "    name: my_env\n"
+            "    cidr: 10.100.0.0/20"
+        )
 
     cidr = (cloud_network_space.get("cidr") or "").strip()
     if not cidr:
@@ -309,7 +317,10 @@ if __name__ == "__main__":
     chosen = resolve_stack(stacks, args.stack)
     space = load_cloud_network_space(chosen["stack_file"], project)
     if not space:
-        fail(f"cloud_network_space (name, cidr) is not set in {chosen['stack_file']}. Add it to use this script.")
+        fail(
+            f"cloud_network_space (name, cidr) is not set in {chosen['stack_file']}. "
+            "Add azure-spoke-network:cloud_network_space to that file to use this script."
+        )
     mask_bits = mask_to_int(args.mask)
     msg(f"Stack: {chosen['full_name']}  mask: {args.mask}  address space: {space['cidr']}", COLOR_CYAN)
     try:

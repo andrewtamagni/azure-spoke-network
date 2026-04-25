@@ -1,4 +1,4 @@
 name: azure-spoke-network
 runtime:
   name: python
-description: Netowrk resources for an Azure spoke network.
+description: Network resources for an Azure spoke network.
